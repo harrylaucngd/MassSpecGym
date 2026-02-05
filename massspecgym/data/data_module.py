@@ -22,6 +22,8 @@ class MassSpecDataModule(pl.LightningDataModule):
         batch_size: int,
         num_workers: int = 0,
         persistent_workers: bool = True,
+        pin_memory: bool = False,
+        prefetch_factor: Optional[int] = None,
         split_pth: Optional[Path] = None,
         **kwargs
     ):
@@ -37,6 +39,8 @@ class MassSpecDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.persistent_workers = persistent_workers if num_workers > 0 else False
+        self.pin_memory = bool(pin_memory)
+        self.prefetch_factor = prefetch_factor if (num_workers > 0) else None
 
     def prepare_data(self):
         """Pre-processing to be executed only on a single main device when using distributed training."""
@@ -76,34 +80,49 @@ class MassSpecDataModule(pl.LightningDataModule):
             self.test_dataset = Subset(self.dataset, np.where(split_mask == "test")[0])
 
     def train_dataloader(self):
+        dl_kwargs = {}
+        if self.prefetch_factor is not None:
+            dl_kwargs["prefetch_factor"] = int(self.prefetch_factor)
         return DataLoader(
             self.train_dataset,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
             persistent_workers=self.persistent_workers,
+            pin_memory=self.pin_memory,
             drop_last=False,
             collate_fn=self.dataset.collate_fn,
+            **dl_kwargs,
         )
 
     def val_dataloader(self):
+        dl_kwargs = {}
+        if self.prefetch_factor is not None:
+            dl_kwargs["prefetch_factor"] = int(self.prefetch_factor)
         return DataLoader(
             self.val_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
             persistent_workers=self.persistent_workers,
+            pin_memory=self.pin_memory,
             drop_last=False,
             collate_fn=self.dataset.collate_fn,
+            **dl_kwargs,
         )
 
     def test_dataloader(self):
+        dl_kwargs = {}
+        if self.prefetch_factor is not None:
+            dl_kwargs["prefetch_factor"] = int(self.prefetch_factor)
         return DataLoader(
             self.test_dataset,
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_workers,
             persistent_workers=self.persistent_workers,
+            pin_memory=self.pin_memory,
             drop_last=False,
             collate_fn=self.dataset.collate_fn,
+            **dl_kwargs,
         )

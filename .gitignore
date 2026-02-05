@@ -139,3 +139,6 @@ dmypy.json
 
 # W&B
 wandb/
+
+# Models
+checkpoints/

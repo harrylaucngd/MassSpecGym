@@ -102,6 +102,107 @@ data_module = MassSpecDataModule(
 
 Finally, MassSpecGym defines evaluation metrics by implementing abstract subclasses of `LightningModule` for each of the MassSpecGym challenges: [`DeNovoMassSpecGymModel`](https://github.com/pluskal-lab/MassSpecGym/blob/df2ff567ed5ad60244b4106a180aaebc3c787b7e/massspecgym/models/de_novo/base.py#L14), [`RetrievalMassSpecGymModel`](https://github.com/pluskal-lab/MassSpecGym/blob/df2ff567ed5ad60244b4106a180aaebc3c787b7e/massspecgym/models/retrieval/base.py#L14), and [`SimulationMassSpecGymModel`](https://github.com/pluskal-lab/MassSpecGym/blob/df2ff567ed5ad60244b4106a180aaebc3c787b7e/massspecgym/models/simulation/base.py#L12). To implement a custom model, you should inherit from the appropriate abstract class and implement the `forward` and `step` methods. This procedure is described in the next section. If you looking for more examples, please see the [`massspecgym/models`](https://github.com/pluskal-lab/MassSpecGym/tree/df2ff567ed5ad60244b4106a180aaebc3c787b7e/massspecgym/models) folder.
 
+## 🔎 SpecBridge retrieval evaluation (official MassSpecGym metrics)
+
+This repository contains a self-contained SpecBridge-compatible inference implementation under `massspecgym/specbridge/` and a retrieval model wrapper `massspecgym/models/retrieval/specbridge.py`. This allows evaluating SpecBridge checkpoints with **MassSpecGym's official retrieval metrics** (HitRate@K and MCES@1), including the **formula-bonus** candidate set.
+
+### 1) Precompute candidate embeddings (ChemBERTa)
+
+This step downloads MassSpecGym data/candidate sets from the Hugging Face Hub if needed.
+It also requires the `transformers` Python package to load ChemBERTa.
+
+```bash
+python scripts/specbridge_precompute_candidate_embeddings.py \
+  --specbridge-ckpt checkpoints/last.pt \
+  --output checkpoints/specbridge_candidates_mass_test.pt \
+  --normalize \
+  --load-weights-from-ckpt
+```
+
+For the formula-bonus candidate set:
+
+```bash
+python scripts/specbridge_precompute_candidate_embeddings.py \
+  --specbridge-ckpt checkpoints/last.pt \
+  --candidates-pth bonus \
+  --output checkpoints/specbridge_candidates_formula_test.pt \
+  --normalize \
+  --load-weights-from-ckpt
+```
+
+### 2) Run retrieval evaluation on the official test split
+
+Standard retrieval:
+
+```bash
+python scripts/eval_specbridge_retrieval.py \
+  --specbridge-ckpt checkpoints/last.pt \
+  --candidate-embeddings checkpoints/specbridge_candidates_mass_test.pt \
+  --normalize
+```
+
+Formula-bonus retrieval:
+
+```bash
+python scripts/eval_specbridge_retrieval.py \
+  --specbridge-ckpt checkpoints/last.pt \
+  --candidates-pth bonus \
+  --candidate-embeddings checkpoints/specbridge_candidates_formula_test.pt \
+  --normalize
+```
+
+## 🔎 DiffMS/MIST encoder retrieval evaluation (MSG subformula test set)
+
+This repository also contains a self-contained, **DiffMS-independent** implementation of the MIST spectra encoder inference under `massspecgym/mist/` and a retrieval wrapper `massspecgym/models/retrieval/mist_encoder.py`.
+Retrieval ranking is performed by computing **Tanimoto similarity** between the thresholded predicted fingerprint and each candidate's **4096-dim Morgan (ECFP) fingerprint (radius=2)**.
+
+### 1) Prepare MSG subformula-assigned data (DiffMS preprocessed MSG)
+
+The evaluation script expects the following files/folders:
+
+- `data/msg/labels.tsv`
+- `data/msg/split.tsv`
+- `data/msg/subformulae/default_subformulae/` (contains `<spec>.json` trees)
+
+If you don't have them, DiffMS provides a download script that fetches the preprocessed MSG package:
+
+```bash
+bash DiffMS/data_processing/02_download_msg_data.sh
+```
+
+### 2) Run retrieval evaluation (standard or formula-bonus candidates)
+
+Standard retrieval:
+
+```bash
+python scripts/eval_mist_msg_retrieval.py \
+  --mist-ckpt checkpoints/encoder_msg.pt \
+  --labels-pth data/msg/labels.tsv \
+  --split-pth data/msg/split.tsv \
+  --subform-folder data/msg/subformulae/default_subformulae \
+  --accelerator gpu \
+  --batch-size 16 \
+  --num-workers 16 \
+  --pin-memory \
+  --skip-mces
+```
+
+Formula-bonus retrieval:
+
+```bash
+python scripts/eval_mist_msg_retrieval.py \
+  --mist-ckpt checkpoints/encoder_msg.pt \
+  --labels-pth data/msg/labels.tsv \
+  --split-pth data/msg/split.tsv \
+  --subform-folder data/msg/subformulae/default_subformulae \
+  --candidates-pth bonus \
+  --accelerator gpu \
+  --batch-size 16 \
+  --num-workers 16 \
+  --pin-memory \
+  --skip-mces
+```
+
 ## 🚀 Train and evaluate your model
 
 MassSpecGym allows you to implement, train, validate, and test your model with a few lines of code. Built on top of PyTorch Lightning, MassSpecGym abstracts data preparation and splitting while eliminating boilerplate code for training and evaluation loops. To train and evaluate your model, you only need to implement your custom architecture and prediction logic.
