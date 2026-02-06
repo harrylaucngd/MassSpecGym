@@ -151,6 +151,24 @@ python scripts/eval_specbridge_retrieval.py \
   --normalize
 ```
 
+### Peak-count analysis (test set)
+
+To plot the distribution of MS2 peak counts in the **official test split** (after the same preprocessing used for SpecBridge evaluation) and to compute SpecBridge HitRate@K stratified by peak count:
+
+```bash
+python scripts/analyze_specbridge_peaks.py \
+  --specbridge-ckpt checkpoints/last.pt \
+  --candidate-embeddings checkpoints/specbridge_candidates_formula_test.pt \
+  --candidates-pth bonus \
+  --normalize \
+  --accelerator gpu \
+  --batch-size 64 \
+  --num-workers 32 \
+  --pin-memory
+```
+
+Outputs are written to `results/specbridge_peak_analysis/` by default.
+
 ## 🔎 DiffMS/MIST encoder retrieval evaluation (MSG subformula test set)
 
 This repository also contains a self-contained, **DiffMS-independent** implementation of the MIST spectra encoder inference under `massspecgym/mist/` and a retrieval wrapper `massspecgym/models/retrieval/mist_encoder.py`.
