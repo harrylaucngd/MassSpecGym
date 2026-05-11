@@ -192,11 +192,7 @@ class RetrievalDataset(MassSpecDataset):
         self.candidates_pth = candidates_pth
         super().__init__(**kwargs)
 
-    def load_data(self):
-
-        super().load_data()
-
-        # Download candidates from HuggigFace Hub if not a path to exisiting file is passed
+    def _load_candidates(self):
         if self.candidates_pth is None:
             self.candidates_pth = utils.hugging_face_download(
                 "molecules/MassSpecGym_retrieval_candidates_mass.json"
@@ -206,14 +202,14 @@ class RetrievalDataset(MassSpecDataset):
                 "molecules/MassSpecGym_retrieval_candidates_formula.json"
             )
         elif isinstance(self.candidates_pth, str):
-            if Path(self.candidates_pth).is_file():
-                self.candidates_pth = Path(self.candidates_pth)
-            else:
-                self.candidates_pth = utils.hugging_face_download(self.candidates_pth)
+            p = Path(self.candidates_pth)
+            self.candidates_pth = p if p.is_file() else utils.hugging_face_download(self.candidates_pth)
+        with open(self.candidates_pth, "r") as f:
+            self.candidates = json.load(f)
 
-        # Read candidates_pth from json to dict: SMILES -> respective candidate SMILES
-        with open(self.candidates_pth, "r") as file:
-            self.candidates = json.load(file)
+    def load_data(self):
+        super().load_data()
+        self._load_candidates()
 
     def __getitem__(self, i) -> dict:
         item = super().__getitem__(i, transform_mol=False)
