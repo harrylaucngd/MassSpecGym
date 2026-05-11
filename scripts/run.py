@@ -133,12 +133,6 @@ parser.add_argument('--exclude_inchikeys', type=str, default=None,
     help='Path to InChIKey exclusion list for data safety')
 parser.add_argument('--encoder_checkpoint', type=str, default=None,
     help='Path to pretrained MIST encoder checkpoint')
-parser.add_argument('--subform_folder', type=str, default=None,
-    help='Subformulae JSON folder for MIST retrieval (e.g. data/msg/subformulae/default_subformulae).')
-parser.add_argument('--fp_save_path', type=str, default=None,
-    help='If set, save raw predicted fingerprints (float32) to this .pt path during test.')
-parser.add_argument('--fp_similarity', type=str, default='cosine', choices=['cosine', 'tanimoto'],
-    help='Similarity metric for MIST fingerprint retrieval.')
 parser.add_argument('--decoder_checkpoint', type=str, default=None,
     help='Path to pretrained decoder checkpoint')
 parser.add_argument('--num_generation_samples', type=int, default=10,
@@ -230,20 +224,7 @@ def main(args):
 
     # Load dataset
     if args.task == 'retrieval':
-        if args.model == 'mist_fingerprint':
-            from massspecgym.data.mist_dataset import MISTRetrievalDataset
-            dataset = MISTRetrievalDataset(
-                subform_folder=args.subform_folder,
-                mist_split_pth=mist_split_pth,
-                pth=args.dataset_pth,
-                fp_size=args.fp_size,
-                candidates_pth=args.candidates_pth,
-                inferred_formula=args.inferred_formula,
-                inferred_formula_pth=args.inferred_formula_pth,
-                identifiers_subset=identifiers_subset,
-            )
-        else:
-            if args.model == 'fingerprint_ffn':
+        if args.model == 'fingerprint_ffn':
                 spec_transform = SpecBinner(max_mz=args.max_mz, bin_width=args.bin_width)
             else:
                 spec_transform = SpecTokenizer(n_peaks=args.n_peaks, matchms_kwargs=dict(mz_to=args.max_mz))
@@ -323,15 +304,6 @@ def main(args):
             )
         elif args.model == 'random':
             model = RandomRetrieval(
-                **common_kwargs
-            )
-        elif args.model == 'mist_fingerprint':
-            from massspecgym.models.retrieval import MISTFingerprintRetrieval
-            model = MISTFingerprintRetrieval(
-                encoder_checkpoint=args.encoder_checkpoint,
-                fp_bits=args.fp_size,
-                similarity=args.fp_similarity,
-                fp_save_path=args.fp_save_path,
                 **common_kwargs
             )
         else:
