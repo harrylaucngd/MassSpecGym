@@ -10,6 +10,15 @@ from torch.utils.data.dataloader import DataLoader
 from massspecgym.data.datasets import MassSpecDataset
 
 
+def _normalize_split_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Strip headers and map MassSpecGym MSG-style columns to identifier/fold."""
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+    if "name" in df.columns and "split" in df.columns:
+        df = df.rename(columns={"name": "identifier", "split": "fold"})
+    return df
+
+
 class MassSpecDataModule(pl.LightningDataModule):
     """
     Data module containing a mass spectrometry dataset. This class is responsible for loading, splitting, and wrapping
@@ -50,13 +59,19 @@ class MassSpecDataModule(pl.LightningDataModule):
             self.split = self.dataset.metadata[["identifier", "fold"]]
         else:
             # NOTE: custom split is not tested
-            self.split = pd.read_csv(self.split_pth, sep="\t")
+            self.split = _normalize_split_df(pd.read_csv(self.split_pth, sep="\t"))
             if set(self.split.columns) != {"identifier", "fold"}:
-                raise ValueError('Split file must contain "id" and "fold" columns.')
-            self.split["identifier"] = self.split["identifier"].astype(str)
-            if set(self.dataset.metadata["identifier"]) != set(self.split["identifier"]):
                 raise ValueError(
-                    "Dataset item IDs must match the IDs in the split file."
+                    'Split file must have columns ("identifier", "fold") or '
+                    '("name", "split").'
+                )
+            self.split["identifier"] = self.split["identifier"].astype(str)
+            meta_ids = set(self.dataset.metadata["identifier"].astype(str))
+            split_ids = set(self.split["identifier"])
+            if not meta_ids.issubset(split_ids):
+                raise ValueError(
+                    "Every dataset identifier must appear in the split file "
+                    f"(missing {len(meta_ids - split_ids)} IDs)."
                 )
 
         self.split = self.split.set_index("identifier")["fold"]

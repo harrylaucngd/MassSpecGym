@@ -73,22 +73,23 @@ class MassSpecDataset(Dataset):
             self.spectra = self.metadata.apply(
                 lambda row: matchms.Spectrum(
                     mz=np.array([float(m) for m in row["mzs"].split(",")]),
-                    intensities=np.array(
-                        [float(i) for i in row["intensities"].split(",")]
-                    ),
+                    intensities=np.array([float(i) for i in row["intensities"].split(",")]),
                     metadata={"precursor_mz": row["precursor_mz"]},
                 ),
                 axis=1,
             )
-            self.metadata = self.metadata.drop(columns=["mzs", "intensities"])
+            self.metadata = self.metadata.drop(columns=["mzs", "intensities"], errors="ignore")
         elif self.pth.suffix == ".mgf":
             self.spectra = pd.Series(list(load_from_mgf(str(self.pth))))
             self.metadata = pd.DataFrame([s.metadata for s in self.spectra])
         else:
             raise ValueError(f"{self.pth.suffix} file format not supported.")
-        
+
         if self.identifiers_subset is not None:
-            self.metadata = self.metadata[self.metadata["identifier"].isin(self.identifiers_subset)]
+            id_subset = self.metadata["identifier"].astype(str).isin(
+                set(map(str, self.identifiers_subset))
+            )
+            self.metadata = self.metadata[id_subset]
             self.spectra = self.spectra[self.metadata.index].reset_index(drop=True)
             self.metadata = self.metadata.reset_index(drop=True)
 
