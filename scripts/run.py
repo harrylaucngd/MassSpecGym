@@ -3,7 +3,6 @@ import datetime
 import typing as T
 from pathlib import Path
 
-import pandas as pd
 from rdkit import RDLogger
 import pytorch_lightning as pl
 from pytorch_lightning import Trainer
@@ -12,13 +11,16 @@ from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 import massspecgym.utils as utils
 from massspecgym.data import RetrievalDataset, MassSpecDataset, MassSpecDataModule
 from massspecgym.data.transforms import (
-    MolFingerprinter, SpecBinner, SpecTokenizer, MolToFormulaVector
+    MolFingerprinter, SpecBinner, SpecTokenizer, MolToFormulaVector,
+    MISTPeakFormulaTokenizer,
 )
 from massspecgym.models.base import Stage
 from massspecgym.models.retrieval import (
-    FingerprintFFNRetrieval, FromDictRetrieval, RandomRetrieval, DeepSetsRetrieval
+    FingerprintFFNRetrieval, FromDictRetrieval, RandomRetrieval, DeepSetsRetrieval,
+    MISTFingerprintRetrieval, GenerativeRetrieval, IcebergRetrieval,
 )
 from massspecgym.models.de_novo import SmilesTransformer, FRIGIDDecoder, MolForgeDecoder, DiffMSDecoder
+from massspecgym.models.encoders.mist.encoder import SpectraEncoderGrowing
 from massspecgym.models.tokenizers import SmilesBPETokenizer, SelfiesTokenizer
 from massspecgym.data.fp2mol_dataset import FP2MolDataset
 from massspecgym.definitions import MASSSPECGYM_TEST_RESULTS_DIR
@@ -43,11 +45,6 @@ parser.add_argument('--no_wandb', action='store_true')
 parser.add_argument('--seed', type=int, default=0)
 parser.add_argument('--debug', action='store_true')
 parser.add_argument('--test_only', action='store_true')
-parser.add_argument(
-    '--skip_mces_test',
-    action='store_true',
-    help='Skip MCES@1 on the test set (much faster; hit-rate metrics still run).',
-)
 
 # Data paths
 parser.add_argument('--candidates_pth', type=str, default=None)
@@ -66,7 +63,7 @@ parser.add_argument('--bin_width', type=float, default=1)
 parser.add_argument('--n_peaks', type=int, default=60)
 
 # - Fingerprinter
-parser.add_argument('--fp_size', type=int, default=4096)
+parser.add_argument('--fp_size', type=int, default=2048)
 
 # Training setup
 parser.add_argument('--max_epochs', type=int, default=50)
@@ -82,16 +79,13 @@ parser.add_argument('--weight_decay', type=float, default=0.0)
 
 # Task and model
 parser.add_argument('--task', type=str, choices=['retrieval', 'de_novo', 'simulation'], required=True)
-# NEW: add formula toggle to use inferred formula (applicable to retrieval and de novo tasks)
-parser.add_argument('--inferred_formula', action='store_true',
-    help='Use inferred formula for retrieval.')
-parser.add_argument('--inferred_formula_pth', type=str, default=None,
-    help='Path to JSON mapping identifier -> formula string. Required when --inferred_formula is True.')
 parser.add_argument('--model', type=str, required=True)
 parser.add_argument('--log_only_loss_at_stages', default=(),
     type=lambda stages: [Stage(s) for s in stages.strip().replace(' ', '').split(',')])
 parser.add_argument('--df_test_pth', type=Path, default=None)
 parser.add_argument('--checkpoint_pth', type=Path, default=None)
+parser.add_argument('--challenge', type=str, default='auto', choices=['auto', 'mass', 'formula'],
+    help='Retrieval/de novo challenge type. Formula-only models require formula.')
 
 # - De novo
 
@@ -135,6 +129,15 @@ parser.add_argument('--encoder_checkpoint', type=str, default=None,
     help='Path to pretrained MIST encoder checkpoint')
 parser.add_argument('--decoder_checkpoint', type=str, default=None,
     help='Path to pretrained decoder checkpoint')
+parser.add_argument('--gen_checkpoint', type=str, default=None,
+    help='Path to ICEBERG fragment-generation checkpoint')
+parser.add_argument('--inten_checkpoint', type=str, default=None,
+    help='Path to ICEBERG intensity checkpoint')
+parser.add_argument('--subformulae_dir', type=str, default=None,
+    help='Path to precomputed MIST subformulae JSON directory')
+parser.add_argument('--decoder_type', type=str, default='frigid',
+    choices=['frigid', 'molforge', 'diffms'],
+    help='FP2Mol decoder type for generative retrieval')
 parser.add_argument('--num_generation_samples', type=int, default=10,
     help='Number of molecules to generate per spectrum')
 parser.add_argument('--mol_repr', type=str, default='smiles',
@@ -142,54 +145,53 @@ parser.add_argument('--mol_repr', type=str, default='smiles',
     help='Molecular representation for FP2Mol training data')
 
 
-def _parse_split_tsv_roles(
-    split_pth: T.Optional[str],
-) -> tuple[T.Optional[str], T.Optional[str]]:
-    """Return (mist_split_pth, datamodule_split_pth) for MSG vs standard split files."""
-    if not split_pth:
-        return None, None
-    cols = set(pd.read_csv(split_pth, sep="\t", nrows=0).columns)
-    if cols == {"name", "split"}:
-        return split_pth, None
-    if cols == {"identifier", "fold"}:
-        return None, split_pth
-    raise ValueError(
-        "split TSV must have columns (name, split) or (identifier, fold); "
-        f"got {sorted(cols)}"
-    )
+FORMULA_ONLY_MODELS = {
+    ('retrieval', 'mist_fingerprint'),
+    ('retrieval', 'generative_retrieval'),
+    ('de_novo', 'frigid'),
+    ('de_novo', 'molforge'),
+    ('de_novo', 'diffms'),
+}
 
 
-def _load_test_identifiers(
-    dataset_pth: T.Optional[str],
-    mist_split_pth: T.Optional[str],
-    datamodule_split_pth: T.Optional[str],
-) -> T.List[str]:
-    """Identifiers in the test fold (for --test_only subset loading)."""
-    if datamodule_split_pth is not None:
-        df = pd.read_csv(datamodule_split_pth, sep="\t")
-        return df.loc[df["fold"] == "test", "identifier"].astype(str).tolist()
-    if mist_split_pth is not None:
-        df = pd.read_csv(mist_split_pth, sep="\t")
-        df = df.rename(columns={"name": "identifier", "split": "fold"})
-        return df.loc[df["fold"] == "test", "identifier"].astype(str).tolist()
-    pth = dataset_pth
-    if pth is None:
-        pth = str(utils.hugging_face_download("MassSpecGym.tsv"))
-    try:
-        fold_df = pd.read_csv(
-            pth, sep="\t", usecols=lambda c: c in ("identifier", "fold")
-        )
-    except ValueError as err:
+def _infer_challenge(args) -> str:
+    if args.challenge != 'auto':
+        return args.challenge
+    if args.candidates_pth == 'bonus':
+        return 'formula'
+    if args.candidates_pth and 'formula' in str(args.candidates_pth).lower():
+        return 'formula'
+    return 'mass'
+
+
+def _validate_challenge(args) -> None:
+    if args.task == 'de_novo' and args.training_mode == 'fp2mol_pretrain':
+        return
+    challenge = _infer_challenge(args)
+    if (args.task, args.model) in FORMULA_ONLY_MODELS and challenge != 'formula':
         raise ValueError(
-            "test_only requires --split_pth when the dataset TSV has no "
-            "identifier/fold columns (e.g. MIST labels.tsv)."
-        ) from err
-    return fold_df.loc[fold_df["fold"] == "test", "identifier"].astype(str).tolist()
+            f"Model {args.model!r} requires the formula-based challenge because it "
+            "uses precursor formula/subformula features."
+        )
+
+
+def _build_mist_encoder(output_size: int) -> SpectraEncoderGrowing:
+    return SpectraEncoderGrowing(
+        form_embedder="pos-cos",
+        output_size=output_size,
+        hidden_size=256,
+        peak_attn_layers=4,
+        num_heads=8,
+        refine_layers=4,
+        set_pooling="cls",
+        pairwise_featurization=True,
+    )
 
 
 def main(args):
     # Seed everything
     pl.seed_everything(args.seed)
+    _validate_challenge(args)
 
     # Get current time
     now = datetime.datetime.now()
@@ -197,8 +199,7 @@ def main(args):
 
     # Process args
     if args.df_test_pth is None and args.devices == 1:
-        formula_tag = "_inferred_formula" if args.inferred_formula else ""
-        args.df_test_pth = MASSSPECGYM_TEST_RESULTS_DIR / f"{args.task}/{args.run_name}{formula_tag}_{now_formatted}.pkl"
+        args.df_test_pth = MASSSPECGYM_TEST_RESULTS_DIR / f"{args.task}/{args.run_name}_{now_formatted}.pkl"
 
     # Init paths to data files
     if args.debug:
@@ -206,37 +207,27 @@ def main(args):
         args.candidates_pth = "../data/debug/example_5_spectra_candidates.json"
         args.split_pth="../data/debug/example_5_spectra_split.tsv"
 
-    mist_split_pth, datamodule_split_pth = _parse_split_tsv_roles(args.split_pth)
-    datamodule_split_effective = None if args.test_only else datamodule_split_pth
-
-    identifiers_subset: T.Optional[T.List[str]] = None
-    if args.test_only and args.task in ("retrieval", "de_novo"):
-        if (
-            args.task == "de_novo"
-            and args.training_mode == "fp2mol_pretrain"
-            and args.molecule_library is not None
-        ):
-            pass
-        else:
-            identifiers_subset = _load_test_identifiers(
-                args.dataset_pth, mist_split_pth, datamodule_split_pth
-            )
-
     # Load dataset
     if args.task == 'retrieval':
         if args.model == 'fingerprint_ffn':
-                spec_transform = SpecBinner(max_mz=args.max_mz, bin_width=args.bin_width)
-            else:
-                spec_transform = SpecTokenizer(n_peaks=args.n_peaks, matchms_kwargs=dict(mz_to=args.max_mz))
-            dataset = RetrievalDataset(
-                pth=args.dataset_pth,
-                spec_transform=spec_transform,
-                mol_transform=MolFingerprinter(fp_size=args.fp_size),
-                candidates_pth=args.candidates_pth,
-                inferred_formula=args.inferred_formula,
-                inferred_formula_pth=args.inferred_formula_pth,
-                identifiers_subset=identifiers_subset,
+            spec_transform = SpecBinner(max_mz=args.max_mz, bin_width=args.bin_width)
+        elif args.model in {'mist_fingerprint', 'generative_retrieval'}:
+            spec_transform = MISTPeakFormulaTokenizer(
+                n_peaks=args.n_peaks,
+                subformulae_dir=args.subformulae_dir,
+                mz_to=args.max_mz,
             )
+        else:
+            spec_transform = SpecTokenizer(n_peaks=args.n_peaks, matchms_kwargs=dict(mz_to=args.max_mz))
+        dataset = RetrievalDataset(
+            pth=args.dataset_pth,
+            spec_transform=spec_transform,
+            mol_transform=MolFingerprinter(fp_size=args.fp_size),
+            candidates_pth=args.candidates_pth,
+            inferred_formula=args.inferred_formula,
+            inferred_formula_pth=args.inferred_formula_pth,
+            identifiers_subset=identifiers_subset,
+        )
     elif args.task == 'de_novo':
         if args.training_mode == 'fp2mol_pretrain' and args.molecule_library is not None:
             dataset = FP2MolDataset(
@@ -245,14 +236,21 @@ def main(args):
                 fp_bits=args.fp_size,
                 exclude_inchikeys=args.exclude_inchikeys,
             )
+        elif args.model in {'frigid', 'molforge', 'diffms'}:
+            dataset = MassSpecDataset(
+                pth=args.dataset_pth,
+                spec_transform=MISTPeakFormulaTokenizer(
+                    n_peaks=args.n_peaks,
+                    subformulae_dir=args.subformulae_dir,
+                    mz_to=args.max_mz,
+                ),
+                mol_transform=None,
+            )
         else:
             dataset = MassSpecDataset(
                 pth=args.dataset_pth,
                 spec_transform=SpecTokenizer(n_peaks=args.n_peaks, matchms_kwargs=dict(mz_to=args.max_mz)),
-                mol_transform={'formula': MolToFormulaVector(), 'mol': None} if args.use_chemical_formula else None,
-                inferred_formula=args.inferred_formula,
-                inferred_formula_pth=args.inferred_formula_pth,
-                identifiers_subset=identifiers_subset,
+                mol_transform={'formula': MolToFormulaVector(), 'mol': None} if args.use_chemical_formula else None
             )
     else:
         raise NotImplementedError(f"Task {args.task} not implemented.")
@@ -260,21 +258,16 @@ def main(args):
     # Init data module
     data_module = MassSpecDataModule(
         dataset=dataset,
-        split_pth=datamodule_split_effective,
+        split_pth=args.split_pth,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
     )
 
     # Init model
-    no_mces_metrics_at_stages: T.List[Stage] = [Stage.VAL]
-    if args.skip_mces_test:
-        no_mces_metrics_at_stages = [*no_mces_metrics_at_stages, Stage.TEST]
-
     common_kwargs = dict(
         lr=args.lr,
         weight_decay=args.weight_decay,
         log_only_loss_at_stages=args.log_only_loss_at_stages,
-        no_mces_metrics_at_stages=no_mces_metrics_at_stages,
         df_test_path=args.df_test_pth,
     )
     if args.task == 'retrieval':
@@ -299,11 +292,33 @@ def main(args):
         elif args.model == 'from_dict':
             model = FromDictRetrieval(
                 dct_path=args.dct_path,
-                similarity=args.fp_similarity,
                 **common_kwargs
             )
         elif args.model == 'random':
             model = RandomRetrieval(
+                **common_kwargs
+            )
+        elif args.model == 'mist_fingerprint':
+            from massspecgym.models.retrieval import MISTFingerprintRetrieval
+            model = MISTFingerprintRetrieval(
+                encoder_checkpoint=args.encoder_checkpoint,
+                fp_bits=args.fp_size,
+                similarity=args.fp_similarity,
+                fp_save_path=args.fp_save_path,
+                **common_kwargs
+            )
+        elif args.model == 'generative_retrieval':
+            model = GenerativeRetrieval(
+                decoder_type=args.decoder_type,
+                decoder_checkpoint=args.decoder_checkpoint,
+                encoder_checkpoint=args.encoder_checkpoint,
+                fp_bits=args.fp_size,
+                **common_kwargs
+            )
+        elif args.model == 'iceberg_retrieval':
+            model = IcebergRetrieval(
+                gen_checkpoint=args.gen_checkpoint,
+                inten_checkpoint=args.inten_checkpoint,
                 **common_kwargs
             )
         else:
@@ -334,6 +349,8 @@ def main(args):
             )
         elif args.model == 'frigid':
             model = FRIGIDDecoder(
+                encoder=_build_mist_encoder(args.fp_size) if args.training_mode == 'spec2mol' else None,
+                fingerprint_bits=args.fp_size,
                 training_mode=args.training_mode,
                 encoder_checkpoint=args.encoder_checkpoint,
                 num_generation_samples=args.num_generation_samples,
@@ -341,6 +358,8 @@ def main(args):
             )
         elif args.model == 'molforge':
             model = MolForgeDecoder(
+                encoder=_build_mist_encoder(args.fp_size) if args.training_mode == 'spec2mol' else None,
+                fingerprint_bits=args.fp_size,
                 training_mode=args.training_mode,
                 encoder_checkpoint=args.encoder_checkpoint,
                 num_generation_samples=args.num_generation_samples,
@@ -348,6 +367,8 @@ def main(args):
             )
         elif args.model == 'diffms':
             model = DiffMSDecoder(
+                encoder=_build_mist_encoder(args.fp_size) if args.training_mode == 'spec2mol' else None,
+                fingerprint_bits=args.fp_size,
                 training_mode=args.training_mode,
                 encoder_checkpoint=args.encoder_checkpoint,
                 num_generation_samples=args.num_generation_samples,
@@ -366,8 +387,7 @@ def main(args):
         model = type(model).load_from_checkpoint(
             args.checkpoint_pth,
             log_only_loss_at_stages=args.log_only_loss_at_stages,
-            no_mces_metrics_at_stages=no_mces_metrics_at_stages,
-            df_test_path=args.df_test_pth,
+            df_test_path=args.df_test_pth
         )
 
     # Init logger

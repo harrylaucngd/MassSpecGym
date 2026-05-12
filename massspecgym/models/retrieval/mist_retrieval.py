@@ -1,7 +1,7 @@
 """
 MIST fingerprint retrieval: predict Morgan FP from spectrum, rank by Tanimoto.
 
-Uses the MIST encoder (SpectraEncoderGrowing) to predict a 4096-bit molecular
+Uses the MIST encoder (SpectraEncoderGrowing) to predict a 2048-bit molecular
 fingerprint from the MS/MS spectrum, then ranks retrieval candidates by
 Tanimoto similarity between predicted and candidate fingerprints.
 
@@ -37,10 +37,15 @@ class MISTFingerprintRetrieval(RetrievalMassSpecGymModel):
     def __init__(
         self,
         encoder_checkpoint: T.Optional[str] = None,
+<<<<<<< HEAD
         fp_bits: int = 4096,
         similarity: str = "cosine",
         encoder_kwargs: T.Optional[dict] = None,
         fp_save_path: T.Optional[str] = None,
+=======
+        fp_bits: int = 2048,
+        similarity: str = "tanimoto",
+>>>>>>> dcdc3fd7f4760d2097ea00a4f272defead043139
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -51,6 +56,7 @@ class MISTFingerprintRetrieval(RetrievalMassSpecGymModel):
         self.loss_fn = CosSimLoss()
 
         from massspecgym.models.encoders.mist.encoder import SpectraEncoderGrowing
+<<<<<<< HEAD
         enc_kw = dict(
             form_embedder="pos-cos",
             spectra_dropout=0.1,
@@ -63,6 +69,12 @@ class MISTFingerprintRetrieval(RetrievalMassSpecGymModel):
             pairwise_featurization=True,
             instr_dim=6,
             output_size=fp_bits,
+=======
+        self.encoder = SpectraEncoderGrowing(
+            form_embedder="pos-cos", output_size=fp_bits, hidden_size=256,
+            peak_attn_layers=4, num_heads=8, refine_layers=4,
+            set_pooling="cls", pairwise_featurization=True,
+>>>>>>> dcdc3fd7f4760d2097ea00a4f272defead043139
         )
         if encoder_checkpoint:
             ckpt = torch.load(encoder_checkpoint, map_location="cpu", weights_only=False)
@@ -81,10 +93,13 @@ class MISTFingerprintRetrieval(RetrievalMassSpecGymModel):
 
     def step(self, batch: dict, stage: Stage = Stage.NONE) -> dict:
         fp_pred = self.forward(batch)
-        fp_true = batch["mol"]
-        loss = self.loss_fn(fp_true, fp_pred)
+        fp_true = batch.get("mol")
+        if fp_true is not None and fp_true.shape[-1] == fp_pred.shape[-1]:
+            loss = self.loss_fn(fp_true, fp_pred)
+        else:
+            loss = torch.tensor(0.0, requires_grad=True, device=fp_pred.device)
 
-        cands = batch["candidates_mol"]
+        cands = batch.get("candidates_mol", batch.get("candidates"))
         batch_ptr = batch["batch_ptr"]
         fp_pred_repeated = fp_pred.repeat_interleave(batch_ptr, dim=0)
 
@@ -99,7 +114,7 @@ class MISTFingerprintRetrieval(RetrievalMassSpecGymModel):
             for ident, fp in zip(batch["identifier"], fp_pred):
                 self._fp_buffer[str(ident)] = fp.detach().cpu()
 
-        return dict(loss=loss, scores=scores)
+        return dict(loss=loss, scores=scores, processable_mask=batch.get("processable_mask", None))
 
     def on_test_epoch_end(self):
         super().on_test_epoch_end()

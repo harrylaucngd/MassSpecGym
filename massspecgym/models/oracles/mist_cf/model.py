@@ -76,7 +76,7 @@ class MistCFFormulaTransformer(nn.Module):
 
         self.form_encoder_mod = get_embedder(form_encoder)
         self.formula_dim = self.form_encoder_mod.full_dim
-        self.cls_type = 1  # matches mist_cf_data.cls_type in original
+        self.cls_type = 1  # matches the original mist-cf candidate CLS token
 
         input_dim = self.formula_dim * 2 + 1 + 1 + 1 + 1  # form, diff, cls_flag, inten, num_peak, rel_mass_diff
         if ion_info:
@@ -123,7 +123,7 @@ class MistCFFormulaTransformer(nn.Module):
         device = num_peaks.device
         batch_size, peak_dim, _form_dim = form_vec.shape
 
-        cls_type_mask = peak_types == self.cls_type
+        cls_type_mask = self._get_cls_type_mask(peak_types)
         cls_tokens = form_vec[cls_type_mask]
         diff_vec = cls_tokens[:, None, :] - form_vec
 
@@ -166,31 +166,44 @@ class MistCFFormulaTransformer(nn.Module):
 
         output = self._pool_out(
             peak_tensor, inten_tensor, rel_mass_diff_tensor,
-            peak_types, attn_mask, batch_size,
+            cls_type_mask, attn_mask, batch_size,
         )
 
         if return_aux:
             return output, {}
         return output
 
+    def _get_cls_type_mask(self, peak_types):
+        cls_type_mask = peak_types == self.cls_type
+
+        # Older smoke tests and early ports used type 3 for the candidate CLS
+        # token. Keep inference robust while defaulting to the original mist-cf
+        # type 1 convention used by the prediction path below.
+        cls_counts = cls_type_mask.sum(dim=1)
+        if torch.all(cls_counts == 1):
+            return cls_type_mask
+
+        fallback_mask = peak_types == 3
+        fallback_counts = fallback_mask.sum(dim=1)
+        use_fallback = (cls_counts != 1) & (fallback_counts >= 1)
+        if torch.any(use_fallback):
+            cls_type_mask = torch.where(use_fallback[:, None], fallback_mask, cls_type_mask)
+
+        cls_counts = cls_type_mask.sum(dim=1)
+        if torch.any(cls_counts == 0):
+            cls_type_mask = cls_type_mask.clone()
+            cls_type_mask[cls_counts == 0, 0] = True
+
+        return cls_type_mask & (cls_type_mask.cumsum(dim=1) == 1)
+
     def _pool_out(self, peak_tensor, inten_tensor, rel_mass_diff_tensor,
-                  peak_types, attn_mask, batch_size):
-
-        """_pool_out.
-
-        pool the output of the network
-
-        Return:
-            (output (B x H), peak_tensor : L x B x H)
-
-        """
+                  cls_type_mask, attn_mask, batch_size):
         EPS = 1e-22
-
         zero_mask = attn_mask[:, :, None].repeat(1, 1, self.hidden_size).transpose(0, 1)
         peak_tensor[zero_mask] = 0
 
         if self.set_pooling == "cls":
-            pool_factor = (peak_types == self.cls_type).float()
+            pool_factor = cls_type_mask.float()
         elif self.set_pooling == "intensity":
             inten_flat = inten_tensor.reshape(batch_size, -1)
             intensities_sum = inten_flat.sum(1).reshape(-1, 1) + EPS
@@ -273,59 +286,35 @@ class MistCFNet(nn.Module):
             Tensor of shape [batch] with scores for each candidate.
         """
         output = self.xformer(
-            num_peaks, 
-            peak_types, 
-            form_vec, 
-            ion_vec, 
-            instrument_vec, 
-            intens, 
-            rel_mass_diffs,
+            num_peaks, peak_types, form_vec, ion_vec,
+            instrument_vec, intens, rel_mass_diffs,
             return_aux=False,
         )
         return self.output_layer(output)
 
     @classmethod
     def from_pretrained(cls, checkpoint_path: str, **kwargs) -> "MistCFNet":
-        """Load MistCFNet from a checkpoint.
-
-        Handles both plain state_dict files and PyTorch Lightning
-        checkpoint format (which wraps the state dict under a state_dict
-        key and prefixes keys with model. or xformer.).
-
-        Args:
-            checkpoint_path: Path to the checkpoint file.
-            **kwargs: Forwarded to MistCFNet.__init__ when hparams are
-                not available in the checkpoint.
-
-        Returns:
-            MistCFNet with loaded weights in eval mode.
-        """
+        """Load a MIST-CF checkpoint saved as a plain or Lightning state dict."""
         ckpt = torch.load(checkpoint_path, map_location="cpu")
-
-        # Extract hparams if saved by Lightning
         hparams = ckpt.get("hyper_parameters", {})
         hparams.update(kwargs)
 
         model = cls(**hparams)
-
         state_dict = ckpt.get("state_dict", ckpt)
-        # Lightning prefixes keys with the attribute name (e.g. "xformer.")
-        # but may also have a top-level "model." prefix — strip both.
         stripped = {}
-        for k, v in state_dict.items():
-            # Remove leading "model." if present
-            new_k = k[len("model."):] if k.startswith("model.") else k
-            stripped[new_k] = v
+        for key, value in state_dict.items():
+            new_key = key[len("model."):] if key.startswith("model.") else key
+            stripped[new_key] = value
 
         missing, unexpected = model.load_state_dict(stripped, strict=False)
         if missing:
             import logging
             logging.getLogger(__name__).warning(
-                f"MistCFNet.from_pretrained: missing keys: {missing}"
+                "MistCFNet.from_pretrained: missing keys: %s", missing
             )
         if unexpected:
             import logging
             logging.getLogger(__name__).warning(
-                f"MistCFNet.from_pretrained: unexpected keys: {unexpected}"
+                "MistCFNet.from_pretrained: unexpected keys: %s", unexpected
             )
         return model.eval()

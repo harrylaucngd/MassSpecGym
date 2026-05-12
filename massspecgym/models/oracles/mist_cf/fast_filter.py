@@ -1,43 +1,42 @@
 """
-FastFFN: Formula pre-filter model for MIST-CF.
+Fast formula pre-filter for MIST-CF candidate lists.
 
-Scores candidate formulas based only on formula composition (no spectrum),
-used to reduce large SIRIUS candidate sets before the main neural scorer.
-
-Ported from ~/mist-cf/src/mist_cf/fast_form_score/fast_form_model.py.
-Uses the original mist-cf element ordering so that pretrained checkpoints
-from that repo load correctly.
+The original MIST-CF pipeline can enumerate a large number of formulas with
+SIRIUS. FastFFN scores formulas by composition only and keeps a smaller set
+before the spectrum-conditioned MIST-CF scorer runs.
 """
 
 import re
 from typing import List, Optional
 
 import numpy as np
+import pytorch_lightning as pl
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
-import pytorch_lightning as pl
 
 from massspecgym.models.encoders.mist.form_embedders import get_embedder
 from massspecgym.models.encoders.mist.modules import MLPBlocks
 
-# Original mist-cf element ordering — must match training data for checkpoint compat.
+
+# Original mist-cf element ordering. This is intentionally separate from
+# massspecgym.models.encoders.mist.chem_constants.VALID_ELEMENTS so checkpoints
+# trained in the upstream mist-cf code see the expected input order.
 _VALID_ELEMENTS = [
     "C", "N", "P", "O", "S", "Si", "I", "H", "Cl", "F",
     "Br", "B", "Se", "Fe", "Co", "As", "K", "Na",
 ]
 _ELEMENT_VECTORS = np.eye(len(_VALID_ELEMENTS))
-_element_to_pos = {el: _ELEMENT_VECTORS[i] for i, el in enumerate(_VALID_ELEMENTS)}
+_ELEMENT_TO_POS = {el: _ELEMENT_VECTORS[i] for i, el in enumerate(_VALID_ELEMENTS)}
 _FORMULA_RE = re.compile(r"([A-Z][a-z]*)(\d*)")
 
 
 def _formula_to_dense(formula: str) -> np.ndarray:
-    """Dense element-count vector using original mist-cf element ordering."""
     vec = np.zeros(len(_VALID_ELEMENTS), dtype=np.float32)
     for elem, count in _FORMULA_RE.findall(formula):
-        if elem in _element_to_pos:
-            vec += _element_to_pos[elem] * (int(count) if count else 1)
+        if elem in _ELEMENT_TO_POS:
+            vec += _ELEMENT_TO_POS[elem] * (int(count) if count else 1)
     return vec
 
 
@@ -61,14 +60,7 @@ class _InferenceDataset(Dataset):
 
 
 class FastFFN(pl.LightningModule):
-    """Formula pre-filter FFN.
-
-    Scores formulas by composition alone (no spectrum). Used to trim SIRIUS
-    candidate sets before running the full MistCFNet scorer.
-
-    Load pretrained weights with ``FastFFN.load_from_checkpoint(path)``
-    (compatible with checkpoints from ~/mist-cf/src/mist_cf/fast_form_score/).
-    """
+    """Formula-only pre-filter model used by MIST-CF."""
 
     def __init__(
         self,
@@ -84,9 +76,8 @@ class FastFFN(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.form_embedder = get_embedder(form_encoder)
-        input_dim = self.form_embedder.full_dim
         self.mlp = MLPBlocks(
-            input_size=input_dim,
+            input_size=self.form_embedder.full_dim,
             hidden_size=hidden_size,
             dropout=dropout,
             num_layers=layers,
@@ -95,19 +86,10 @@ class FastFFN(pl.LightningModule):
         self.sigmoid = nn.Sigmoid()
 
     def forward(self, formulae: torch.Tensor) -> torch.Tensor:
-        """forward.
-
-        Args:
-            formulae (torch.Tensor): Input tensor.
-
-        Returns:
-            torch.Tensor: Output tensor, shape [batch] with scores for each candidate.
-        """
         inputs = self.form_embedder(formulae)
         output = self.mlp(inputs)
         output = self.output_layer(output)
-        output = self.sigmoid(output)
-        return output.squeeze(-1)
+        return self.sigmoid(output).squeeze(-1)
 
     def _step(self, batch, stage: str):
         x, y = batch["x"].float(), batch["y"].float()
@@ -139,18 +121,7 @@ def fast_filter_candidates(
     device: Optional[torch.device] = None,
     batch_size: int = 256,
 ) -> List[int]:
-    """Score formulas and return indices of the top-k candidates.
-
-    Args:
-        formulas: Candidate formula strings.
-        model: Loaded FastFFN instance.
-        max_k: Maximum number of candidates to keep.
-        device: Torch device (defaults to CPU).
-        batch_size: Inference batch size.
-
-    Returns:
-        List of int indices into ``formulas``, sorted best-first.
-    """
+    """Return top-k formula indices sorted by FastFFN score."""
     if not formulas:
         return []
     if device is None:
@@ -158,7 +129,8 @@ def fast_filter_candidates(
 
     ds = _InferenceDataset(formulas)
     loader = DataLoader(
-        ds, batch_size=batch_size,
+        ds,
+        batch_size=batch_size,
         collate_fn=_InferenceDataset.collate_fn,
         shuffle=False,
     )
@@ -169,6 +141,6 @@ def fast_filter_candidates(
             x = batch["x"].float().to(device)
             scores.extend(model(x).cpu().tolist())
 
-    scores_arr = np.array(scores)
+    scores_arr = np.asarray(scores)
     top_k = min(max_k, len(scores_arr))
     return np.argsort(scores_arr)[::-1][:top_k].tolist()

@@ -31,23 +31,13 @@ class MassSpecDataset(Dataset):
         return_mol_freq: bool = True,
         return_identifier: bool = True,
         identifiers_subset: T.Optional[T.List[str]] = None,
-        dtype: T.Type = torch.float32,
-        inferred_formula: bool = False,
-        inferred_formula_pth: T.Optional[T.Union[str, Path]] = None,
+        dtype: T.Type = torch.float32
     ):
         """
         Args:
-            pth: Path to .tsv or .mgf file. Downloads from HuggingFace if None.
-            inferred_formula: If True, adds inferred formula from dataset metadata
-                to each batch item as batch["formula"]. If False, adds true formula from dataset metadata
-                to each batch item as batch["formula"].
-            inferred_formula_pth: Path to a JSON file mapping MassSpecGym identifier -> formula string.
-                Required when inferred_formula is True.
+            pth (Optional[Path], optional): Path to the .tsv or .mgf file containing the mass spectra.
+                Default is None, in which case the MassSpecGym dataset is downloaded from HuggingFace Hub.
         """
-        if inferred_formula and inferred_formula_pth is None:
-            raise ValueError("inferred_formula_pth must be provided when inferred_formula is True")
-        self.inferred_formula = inferred_formula
-        self.inferred_formula_pth = inferred_formula_pth
         self.pth = pth
         self.spec_transform = spec_transform
         self.mol_transform = mol_transform
@@ -57,8 +47,6 @@ class MassSpecDataset(Dataset):
         self.dtype = dtype
         self.load_data()
         self.compute_mol_freq()
-        if self.inferred_formula:
-            self._load_formula_predictions()
 
     def load_data(self):
 
@@ -73,8 +61,14 @@ class MassSpecDataset(Dataset):
             self.spectra = self.metadata.apply(
                 lambda row: matchms.Spectrum(
                     mz=np.array([float(m) for m in row["mzs"].split(",")]),
-                    intensities=np.array([float(i) for i in row["intensities"].split(",")]),
-                    metadata={"precursor_mz": row["precursor_mz"]},
+                    intensities=np.array(
+                        [float(i) for i in row["intensities"].split(",")]
+                    ),
+                    metadata={
+                        k: row[k]
+                        for k in row.index
+                        if k not in {"mzs", "intensities"}
+                    },
                 ),
                 axis=1,
             )
@@ -99,12 +93,6 @@ class MassSpecDataset(Dataset):
                 self.metadata["inchikey"] = self.metadata["smiles"].apply(utils.smiles_to_inchi_key)
             self.metadata["mol_freq"] = self.metadata.groupby("inchikey")["inchikey"].transform("count")
 
-    def _load_formula_predictions(self):
-        self._formula_predictions: T.Optional[T.Dict[str, str]] = None
-        if self.inferred_formula:
-            with open(self.inferred_formula_pth, "r") as f:
-                self._formula_predictions = json.load(f)
-
     def __len__(self) -> int:
         return len(self.spectra)
 
@@ -122,7 +110,11 @@ class MassSpecDataset(Dataset):
                 for key, transform in self.spec_transform.items():
                     item[key] = transform(spec) if transform is not None else spec
             else:
-                item["spec"] = self.spec_transform(spec)
+                spec_item = self.spec_transform(spec)
+                if isinstance(spec_item, dict):
+                    item.update(spec_item)
+                else:
+                    item["spec"] = spec_item
         else:
             item["spec"] = spec
 
@@ -140,6 +132,8 @@ class MassSpecDataset(Dataset):
         item.update({
             k: metadata[k] for k in ["precursor_mz", "adduct"]
         })
+        if "formula" in metadata.index:
+            item.setdefault("formula_str", metadata["formula"])
 
         if self.return_mol_freq:
             item["mol_freq"] = metadata["mol_freq"]
@@ -147,16 +141,11 @@ class MassSpecDataset(Dataset):
         if self.return_identifier:
             item["identifier"] = metadata["identifier"]
 
-        if not self.inferred_formula:
-            item["formula"] = str(metadata["formula"])
-        elif self.inferred_formula:
-            # Use the inferred formula for the given MassSpecGym identifier for the query molecule
-            identifier = str(metadata["identifier"])
-            item["formula"] = self._formula_predictions.get(identifier, "")
-
         # TODO: this should be refactored
         for k, v in item.items():
-            if not isinstance(v, str):
+            if isinstance(v, torch.Tensor):
+                item[k] = v
+            elif not isinstance(v, str):
                 item[k] = torch.as_tensor(v, dtype=self.dtype)
 
         return item
@@ -183,9 +172,12 @@ class RetrievalDataset(MassSpecDataset):
     ):
         """
         Args:
-            mol_label_transform: Transformation to apply to candidate molecules.
-            candidates_pth: Path to candidates JSON. None downloads mass-based
-                candidates; 'bonus' downloads formula-based candidates.
+            mol_label_transform (MolTransform, optional): Transformation to apply to the candidate molecules.
+                Defaults to `MolToInChIKey()`.
+            candidates_pth (Optional[Union[Path, str]], optional): Path to the .json file containing the candidates for
+                retrieval. Defaults to None, in which case the candidates for standard `molecular retrieval` challenge
+                are downloaded from HuggingFace Hub. If set to `bonus`, the candidates based on molecular formulas
+                for the `bonus chemical formulae challenge` are downloaded instead.
         """
         # note: __init__ calls load_data, these variables are required for load_data to work properly
         self.mol_label_transform = mol_label_transform
@@ -220,7 +212,7 @@ class RetrievalDataset(MassSpecDataset):
         # Get candidates
         if item["mol"] not in self.candidates:
             raise ValueError(f'No candidates for the query molecule {item["mol"]}.')
-        item["candidates"] = list(self.candidates[item["mol"]])
+        item["candidates"] = self.candidates[item["mol"]]
 
         # Save the original SMILES representations of the canidates (for evaluation)
         item["candidates_smiles"] = item["candidates"]
