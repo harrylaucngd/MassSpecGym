@@ -216,6 +216,32 @@ trainer.fit(model, datamodule=data_module)
 # Test
 trainer.test(model, datamodule=data_module)
 ```
+### Evaluating on the Formula-based Challenge vs. the Mass-based Challenge:
+Formula annotation of MS/MS spectra remains an open challenge, motivating MassSpecGym's two retrieval evaluation tracks: the bonus **formula-based** challenge, where ground-truth formulae are provided as input, and the **mass-based challenge**, where they are withheld. Methods that leverage formula information and that wish to compare performance with formula-unaware methods should use evaluation workflows that do not leak ground-truth formulae for the mass-based challenge. One approach is to use an auxiliary method for formula annotation that does not violate the training-test split of MassSpecGym. While multiple methods exist, for simplicity, we provide a data-safe trained version of MIST-CF to generate formula predictions that can then be passed downstream to retrieval methods (see `run_retrieval.py`) or _de novo_ methods. For realistic evaluation, predicted formulae from any tool (MIST-CF, SIRIUS, BUDDY, FIDDLE, etc.) can also be substituted into this script. 
+
+Here is an example of evaluating MIST, a spectrum-to-fingerprint model that can be used for retrieval, with MIST-CF inferred formulae:
+```
+# 1. Predict formulas (any tool) → JSON: {spec_id: [rank1_formula, ...]}
+  python scripts/run_retrieval.py formula \
+      --checkpoint checkpoints/mist_cf.ckpt \
+      --labels data/labels.tsv --split data/split.tsv \
+      --output formulas.json
+
+  # 2. Run MIST encoder over predicted formulas
+  python scripts/run_retrieval.py predict \
+      --mist-ckpt checkpoints/encoder.pt \
+      --labels data/labels.tsv --split data/split.tsv \
+      --formula-predictions formulas.json \
+      --output-dir results/fps/
+
+  # 3. Evaluate retrieval
+  python scripts/run_retrieval.py eval \
+      --fp-dir results/fps/ \
+      --labels data/labels.tsv --split data/split.tsv \
+      --candidates data/MassSpecGym_retrieval_candidates_mass.json \
+      --output-json results/eval.json
+
+```
 
 ## 🧪 v1.5 Model Zoo
 
@@ -241,11 +267,11 @@ MassSpecGym v1.5 extends the benchmark with a comprehensive suite of state-of-th
 
 | Model | Strategy | Description |
 |-------|----------|-------------|
-| **FingerprintFFN** | Direct | FFN predicts fingerprint from binned spectrum |
-| **DeepSets** | Direct | DeepSets predicts fingerprint from peak list |
-| **MISTFingerprintRetrieval** | Bonus | MIST predicts FP, rank by Tanimoto similarity |
-| **GenerativeRetrieval** | Bonus | Any FP2Mol decoder generates molecule, rank by FP similarity |
-| **IcebergRetrieval** | Bonus | ICEBERG simulates spectra, rank by cosine similarity |
+| **FingerprintFFN** | Fingerprint | FFN predicts fingerprint from binned spectrum |
+| **DeepSets** | Fingerprint | DeepSets predicts fingerprint from peak list |
+| **MISTFingerprintRetrieval** | Fingerprint | MIST predicts FP, rank by Tanimoto similarity |
+| **GenerativeRetrieval** | Structure | Any FP2Mol decoder generates molecule, rank by FP similarity |
+| **IcebergRetrieval** | Spectrum | ICEBERG simulates spectra, rank by cosine similarity |
 
 ### Simulation Models (`massspecgym/models/simulation/`)
 
@@ -255,12 +281,14 @@ MassSpecGym v1.5 extends the benchmark with a comprehensive suite of state-of-th
 | **GNN** | Molecular graph + metadata → spectrum via GNN |
 | **ICEBERG** | DAG-based fragmentation with FragGNN + IntenGNN |
 
-### Official Oracles (`massspecgym/models/oracles/`)
+### Provided Oracles (`massspecgym/models/oracles/`)
+Weights for these models can be found on HuggingFace: https://huggingface.co/datasets/roman-bushuiev/MassSpecGym/tree/main/models/
 
-| Oracle | Task | Data-Safe |
+| Oracle | Task | Data-Safe | 
 |--------|------|-----------|
 | **MIST-CF** | Chemical formula prediction from MS/MS spectrum | Yes |
 | **ICEBERG** | MS/MS spectrum simulation from molecular structure | Yes |
+| **DreaMS** | MS/MS spectrum encoder | Yes |
 
 ### Data Utilities (`massspecgym/data/`)
 
