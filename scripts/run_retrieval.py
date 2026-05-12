@@ -206,18 +206,25 @@ def cmd_train(args: argparse.Namespace) -> None:
 
 def add_predict_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--mist-ckpt", type=Path, required=True)
-    p.add_argument("--subform-base", type=Path, required=True,
-                   help="Base dir containing mistcf_rank{1..K}_subformulae/ and default_subformulae/")
     p.add_argument("--labels", type=Path, required=True)
     p.add_argument("--split", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument("--formula-predictions", type=Path, default=None,
+                   help="JSON: {spec_id: [formula_rank1, ..., formula_rankK]} from any method")
+    p.add_argument("--subform-cache", type=Path, default=None,
+                   help="Dir for subformulae JSONs (default: output-dir/subformulae/)")
+    p.add_argument("--spec-dir", type=Path, default=None,
+                   help=".ms files dir; required when subformulae need to be generated on-the-fly")
     p.add_argument("--max-k", type=int, default=5)
     p.add_argument("--threshold", type=float, default=0.187)
     p.add_argument("--save-raw", action="store_true",
                    help="Save raw sigmoid probabilities instead of thresholded binary fps")
     p.add_argument("--also-gt", action="store_true",
-                   help="Also predict using default_subformulae (ground-truth formula)")
-    p.add_argument("--gt-subform-folder", type=Path, default=None)
+                   help="Also run encoder with ground-truth formula (rank0) if present in subform-cache")
+    p.add_argument("--ion-type", type=str, default="[M+H]+",
+                   help="Ion type for on-the-fly subformulae generation")
+    p.add_argument("--mass-tol", type=float, default=15.0,
+                   help="PPM tolerance for subformulae assignment")
     p.add_argument("--accelerator", type=str, default="cpu")
 
 
@@ -332,12 +339,33 @@ def _load_mist_encoder(ckpt_path: str, device):
     return encoder
 
 
+def _ensure_subform_json(
+    spec_id: str,
+    formula: str,
+    ion_type: str,
+    subform_cache: Path,
+    spec_dir: Path | None,
+    mass_tol: float,
+) -> Path | None:
+    """Return path to subformulae JSON, generating it on-the-fly if needed."""
+    out_path = subform_cache / f"{spec_id}.json"
+    if out_path.exists():
+        return out_path
+    if spec_dir is None:
+        return None
+    from massspecgym.preprocessing.subformulae import process_one
+    subform_cache.mkdir(parents=True, exist_ok=True)
+    process_one((spec_id, formula, ion_type, spec_dir, mass_tol, subform_cache, 100))
+    return out_path if out_path.exists() else None
+
+
 def cmd_predict(args: argparse.Namespace) -> None:
     import torch
     import pandas as pd
     from tqdm import tqdm
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
+    subform_cache = args.subform_cache or (args.output_dir / "subformulae")
     device = torch.device("cuda" if args.accelerator in ("gpu", "cuda") and torch.cuda.is_available() else "cpu")
     log.info(f"Device: {device}")
 
@@ -357,39 +385,74 @@ def cmd_predict(args: argparse.Namespace) -> None:
     df = df[df["fold"] == "test"]
     log.info(f"Test set: {len(df)} spectra")
 
-    rank_jobs: list[tuple[str, Path]] = []
-    for k in range(1, args.max_k + 1):
-        folder = args.subform_base / f"mistcf_rank{k}_subformulae"
-        if folder.is_dir():
-            rank_jobs.append((f"mistcf_rank{k}", folder))
-        else:
-            log.warning(f"Missing folder: {folder}")
+    # Build list of (rank_label, {spec_id: formula}) jobs
+    rank_jobs: list[tuple[str, dict | None]] = []
+
+    if args.formula_predictions is not None:
+        with open(args.formula_predictions) as f:
+            formula_preds: dict[str, list[str]] = json.load(f)
+        for k in range(1, args.max_k + 1):
+            rank_map = {}
+            for spec_id, forms in formula_preds.items():
+                if len(forms) >= k:
+                    rank_map[spec_id] = forms[k - 1]
+            if rank_map:
+                rank_jobs.append((f"rank{k}", rank_map))
+            else:
+                log.warning(f"No formulas at rank {k}, stopping.")
+                break
+    else:
+        # No formula predictions — use whatever is already in subform_cache
+        rank_jobs.append(("rank1", None))
 
     if args.also_gt:
-        gt_folder = args.gt_subform_folder or (args.subform_base / "default_subformulae")
-        if gt_folder.is_dir():
-            rank_jobs.append(("gt", gt_folder))
+        gt_cache = subform_cache / "gt"
+        if gt_cache.is_dir() or args.spec_dir is not None:
+            rank_jobs.append(("gt", None))
         else:
-            log.warning(f"Missing GT folder: {gt_folder}")
+            log.warning("--also-gt: no gt subformulae found and no --spec-dir given, skipping.")
 
-    for rank_label, subform_folder in rank_jobs:
+    for rank_label, formula_map in rank_jobs:
         suffix = "_raw" if args.save_raw else ""
         out_path = args.output_dir / f"fingerprints_{rank_label}{suffix}.pt"
         if out_path.exists():
             log.info(f"[SKIP] {rank_label}: {out_path} already exists")
             continue
 
-        log.info(f"\n{'='*60}\nProcessing {rank_label}: {subform_folder}\n{'='*60}")
-        featurizer = MsgSubformulaFeaturizer(subform_folder)
+        rank_cache = subform_cache / rank_label if formula_map is not None else (
+            subform_cache / "gt" if rank_label == "gt" else subform_cache
+        )
+        rank_cache.mkdir(parents=True, exist_ok=True)
+
+        log.info(f"\n{'='*60}\nProcessing {rank_label}: {rank_cache}\n{'='*60}")
+        featurizer = MsgSubformulaFeaturizer(rank_cache)
         fps: dict[str, torch.Tensor] = {}
         skipped = 0
 
         for _, row in tqdm(df.iterrows(), total=len(df), desc=rank_label):
             spec_id = str(row["identifier"])
             instrument = str(row.get("instrument", ""))
-            if not (subform_folder / f"{spec_id}.json").exists():
+
+            # Resolve subformulae JSON path
+            if formula_map is not None:
+                formula = formula_map.get(spec_id)
+                if formula is None:
+                    skipped += 1
+                    continue
+                json_path = _ensure_subform_json(
+                    spec_id, formula, args.ion_type, rank_cache,
+                    args.spec_dir, args.mass_tol,
+                )
+            else:
+                json_path = rank_cache / f"{spec_id}.json"
+                if not json_path.exists():
+                    skipped += 1
+                    continue
+
+            if json_path is None or not json_path.exists():
                 skipped += 1
                 continue
+
             try:
                 mist_input = featurizer.featurize_one(spec_id, instrument)
                 inp = {k: v.to(device) for k, v in mist_input.items()}
@@ -414,7 +477,7 @@ def cmd_predict(args: argparse.Namespace) -> None:
 
 def add_eval_args(p: argparse.ArgumentParser) -> None:
     p.add_argument("--fp-dir", type=Path, required=True,
-                   help="Dir containing fingerprints_mistcf_rank{k}.pt (and optionally fingerprints_gt.pt)")
+                   help="Dir containing fingerprints_rank{k}.pt or fingerprints_mistcf_rank{k}.pt (and optionally fingerprints_gt.pt)")
     p.add_argument("--labels", type=Path, required=True)
     p.add_argument("--split", type=Path, required=True)
     p.add_argument("--candidates", type=Path, required=True,
@@ -441,7 +504,7 @@ def _mol_to_fp(smiles: str, fp_size: int = 4096) -> "np.ndarray | None":
         return None
     bv = rdMolDescriptors.GetMorganFingerprintAsBitVect(mol, 2, nBits=fp_size)
     import numpy as np
-    return (bytes(bv.ToBitString(), "ascii") != ord("0")).view("u1")
+    return np.frombuffer(bv.ToBitString().encode("ascii"), dtype=np.uint8) != ord("0")
 
 
 def _smiles_to_inchikey(smiles: str) -> "str | None":
@@ -645,17 +708,19 @@ def cmd_eval(args: argparse.Namespace) -> None:
             ik_cache = {s: (ik or None) for s, ik in zip(smis, iks)}
         log.info(f"Loaded {len(fp_cache)} cached fps from {args.fp_cache}")
 
-    # Load rank fingerprints
+    # Load rank fingerprints (try new naming first, fall back to old mistcf_ prefix)
     rank_fps: dict[int, dict[str, np.ndarray]] = {}
     if not args.gt_only:
         for k in range(1, args.max_ranks + 1):
-            pth = args.fp_dir / f"fingerprints_mistcf_rank{k}.pt"
-            if pth.exists():
-                raw = torch.load(pth, map_location="cpu", weights_only=False)
-                rank_fps[k] = {sid: t.numpy() for sid, t in raw.items()}
-                log.info(f"  Loaded rank {k}: {len(rank_fps[k])} spectra")
+            for name in (f"fingerprints_rank{k}.pt", f"fingerprints_mistcf_rank{k}.pt"):
+                pth = args.fp_dir / name
+                if pth.exists():
+                    raw = torch.load(pth, map_location="cpu", weights_only=False)
+                    rank_fps[k] = {sid: t.numpy() for sid, t in raw.items()}
+                    log.info(f"  Loaded rank {k}: {len(rank_fps[k])} spectra")
+                    break
             else:
-                log.warning(f"  Missing: {pth.name}")
+                log.warning(f"  Missing rank {k} fp file in {args.fp_dir}")
 
     gt_fps: dict | None = None
     if args.also_gt:
