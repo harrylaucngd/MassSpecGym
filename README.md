@@ -240,7 +240,6 @@ Here is an example of evaluating MIST, a spectrum-to-fingerprint model that can 
       --labels data/labels.tsv --split data/split.tsv \
       --candidates data/MassSpecGym_retrieval_candidates_mass.json \
       --output-json results/eval.json
-
 ```
 
 ## 🧪 v1.5 Model Zoo
