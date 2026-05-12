@@ -19,6 +19,7 @@ class FromDictRetrieval(RetrievalMassSpecGymModel):
         self,
         dct: T.Optional[dict[str, T.Any]] = None,
         dct_path: T.Optional[T.Union[str, Path]] = None,  # pickled dict path
+        similarity: str = "cosine",
         *args,
         **kwargs
     ):
@@ -26,16 +27,20 @@ class FromDictRetrieval(RetrievalMassSpecGymModel):
 
         if dct is None and dct_path is None:
             raise ValueError("Either dct or dct_path must be provided.")
-        
+
         if dct is not None and dct_path is not None:
             raise ValueError("Only one of dct or dct_path must be provided.")
-        
+
         if dct_path is not None:
             with open(dct_path, "rb") as file:
                 dct = pickle.load(file)
 
         dct = {k: torch.tensor(v) for k, v in dct.items()}
         self.dct = dct
+
+        if similarity not in ("cosine", "tanimoto"):
+            raise ValueError(f"Unknown similarity: {similarity}")
+        self.similarity = similarity
 
     def step(
         self, batch: dict, stage: Stage = Stage.NONE
@@ -54,8 +59,13 @@ class FromDictRetrieval(RetrievalMassSpecGymModel):
 
         # Calculate final similarity scores between predicted fingerprints and corresponding
         # candidate fingerprints for retrieval
-        fp_pred_repeated = fp_pred.repeat_interleave(batch_ptr, dim=0)
-        scores = nn.functional.cosine_similarity(fp_pred_repeated, cands).to(fp_true.device)
+        fp_pred_repeated = fp_pred.repeat_interleave(batch_ptr, dim=0).to(cands.dtype)
+        if self.similarity == "tanimoto":
+            inter = (fp_pred_repeated * cands).sum(dim=-1)
+            union = fp_pred_repeated.sum(dim=-1) + cands.sum(dim=-1) - inter
+            scores = (inter / union.clamp(min=1e-8)).to(fp_true.device)
+        else:
+            scores = nn.functional.cosine_similarity(fp_pred_repeated, cands).to(fp_true.device)
 
         # Random baseline, so we return a dummy loss
         loss = torch.tensor(0.0, requires_grad=True, device=fp_true.device)

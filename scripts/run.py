@@ -224,6 +224,9 @@ def main(args):
             spec_transform=spec_transform,
             mol_transform=MolFingerprinter(fp_size=args.fp_size),
             candidates_pth=args.candidates_pth,
+            inferred_formula=args.inferred_formula,
+            inferred_formula_pth=args.inferred_formula_pth,
+            identifiers_subset=identifiers_subset,
         )
     elif args.task == 'de_novo':
         if args.training_mode == 'fp2mol_pretrain' and args.molecule_library is not None:
@@ -296,10 +299,12 @@ def main(args):
                 **common_kwargs
             )
         elif args.model == 'mist_fingerprint':
+            from massspecgym.models.retrieval import MISTFingerprintRetrieval
             model = MISTFingerprintRetrieval(
                 encoder_checkpoint=args.encoder_checkpoint,
                 fp_bits=args.fp_size,
-                similarity="tanimoto",
+                similarity=args.fp_similarity,
+                fp_save_path=args.fp_save_path,
                 **common_kwargs
             )
         elif args.model == 'generative_retrieval':

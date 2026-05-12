@@ -72,15 +72,18 @@ class MassSpecDataset(Dataset):
                 ),
                 axis=1,
             )
-            self.metadata = self.metadata.drop(columns=["mzs", "intensities"])
+            self.metadata = self.metadata.drop(columns=["mzs", "intensities"], errors="ignore")
         elif self.pth.suffix == ".mgf":
             self.spectra = pd.Series(list(load_from_mgf(str(self.pth))))
             self.metadata = pd.DataFrame([s.metadata for s in self.spectra])
         else:
             raise ValueError(f"{self.pth.suffix} file format not supported.")
-        
+
         if self.identifiers_subset is not None:
-            self.metadata = self.metadata[self.metadata["identifier"].isin(self.identifiers_subset)]
+            id_subset = self.metadata["identifier"].astype(str).isin(
+                set(map(str, self.identifiers_subset))
+            )
+            self.metadata = self.metadata[id_subset]
             self.spectra = self.spectra[self.metadata.index].reset_index(drop=True)
             self.metadata = self.metadata.reset_index(drop=True)
 
@@ -181,11 +184,7 @@ class RetrievalDataset(MassSpecDataset):
         self.candidates_pth = candidates_pth
         super().__init__(**kwargs)
 
-    def load_data(self):
-
-        super().load_data()
-
-        # Download candidates from HuggigFace Hub if not a path to exisiting file is passed
+    def _load_candidates(self):
         if self.candidates_pth is None:
             self.candidates_pth = utils.hugging_face_download(
                 "molecules/MassSpecGym_retrieval_candidates_mass.json"
@@ -195,14 +194,14 @@ class RetrievalDataset(MassSpecDataset):
                 "molecules/MassSpecGym_retrieval_candidates_formula.json"
             )
         elif isinstance(self.candidates_pth, str):
-            if Path(self.candidates_pth).is_file():
-                self.candidates_pth = Path(self.candidates_pth)
-            else:
-                self.candidates_pth = utils.hugging_face_download(self.candidates_pth)
+            p = Path(self.candidates_pth)
+            self.candidates_pth = p if p.is_file() else utils.hugging_face_download(self.candidates_pth)
+        with open(self.candidates_pth, "r") as f:
+            self.candidates = json.load(f)
 
-        # Read candidates_pth from json to dict: SMILES -> respective candidate SMILES
-        with open(self.candidates_pth, "r") as file:
-            self.candidates = json.load(file)
+    def load_data(self):
+        super().load_data()
+        self._load_candidates()
 
     def __getitem__(self, i) -> dict:
         item = super().__getitem__(i, transform_mol=False)
